@@ -232,6 +232,53 @@ def make_hf_judge_fn(judge_model: Any, judge_tokenizer: Any) -> Callable[[str], 
     return judge_fn
 
 
+def make_hf_batch_judge_fn(judge_model: Any, judge_tokenizer: Any) -> Callable[[list[str]], list[dict]]:
+    """
+    Batched variant of make_hf_judge_fn: judges many prompts in ONE generate() call.
+    Same chat template, same JUDGE_GEN_KWARGS (greedy, max_new_tokens=96), same
+    first-EOS slicing and token counting as the single-prompt version.
+
+    Prompts are LEFT-padded so every sequence ends right where generation starts
+    (required for batched generation with decoder-only models).
+    Returns one {"text": str, "num_tokens": int} per prompt, in input order.
+    """
+    import torch
+
+    def batch_judge_fn(prompts: list[str]) -> list[dict]:
+        if not prompts:
+            return []
+        texts = [
+            judge_tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
+            )
+            for p in prompts
+        ]
+        old_side = judge_tokenizer.padding_side
+        judge_tokenizer.padding_side = "left"
+        try:
+            inputs = judge_tokenizer(texts, return_tensors="pt", padding=True)
+        finally:
+            judge_tokenizer.padding_side = old_side
+        inputs = {k: v.to(judge_model.device) for k, v in inputs.items()}
+        prompt_len = inputs["input_ids"].shape[1]
+
+        kwargs = dict(JUDGE_GEN_KWARGS)
+        kwargs.setdefault("pad_token_id", judge_tokenizer.eos_token_id)
+
+        with torch.no_grad():
+            output_ids = judge_model.generate(**inputs, **kwargs)
+
+        eos_ids = _get_eos_token_ids(judge_model, judge_tokenizer)
+        results = []
+        for i in range(output_ids.shape[0]):
+            gen_tokens = _slice_to_first_eos(output_ids[i][prompt_len:], eos_ids)
+            text = judge_tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            results.append({"text": text, "num_tokens": len(gen_tokens)})
+        return results
+
+    return batch_judge_fn
+
+
 def save_results_summary(results_list: list[dict[str, Any]], filepath: str = "outputs/results_summary.json") -> None:
     """
     Saves results_summary.json conforming strictly to the assignment schema:
