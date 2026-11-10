@@ -279,6 +279,102 @@ def make_hf_batch_judge_fn(judge_model: Any, judge_tokenizer: Any) -> Callable[[
     return batch_judge_fn
 
 
+def make_hf_verdict_logprob_fn(
+    judge_model: Any,
+    judge_tokenizer: Any,
+    verdict_prefix: str = "Verdict:",
+    valid_text: str = " VALID",
+    invalid_text: str = " INVALID",
+) -> Callable[[list[str]], list[dict]]:
+    """
+    (Optional bonus) Continuous step confidence from the judge's raw logits.
+
+    For each judge prompt, the context is the chat-templated prompt followed by the
+    tokens of "Verdict:" -- exactly the context in which the judge wrote its verdict
+    during the main run (every judge output starts with "Verdict: VALID|INVALID").
+    We then compute the FULL-SEQUENCE log-probability of each continuation
+    (" VALID" and " INVALID"), i.e. the sum of log-probs of all of its tokens with
+    teacher forcing, so the method is correct even if a word splits into several
+    tokens. The first-token comparison is returned too.
+
+    Returns one dict per prompt:
+      logp_valid, logp_invalid            full-sequence log-probs
+      first_logp_valid, first_logp_invalid log-probs of the FIRST token of each word
+      n_tokens_valid, n_tokens_invalid     token lengths of the two continuations
+    """
+    import torch
+
+    valid_ids = judge_tokenizer.encode(valid_text, add_special_tokens=False)
+    invalid_ids = judge_tokenizer.encode(invalid_text, add_special_tokens=False)
+    prefix_tail = judge_tokenizer.encode(verdict_prefix, add_special_tokens=False)
+    alternatives = [valid_ids, invalid_ids]
+    keep = max(len(a) for a in alternatives)  # logits needed at the last `keep` positions
+    pad_id = judge_tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = judge_tokenizer.eos_token_id
+
+    def logprob_fn(prompts: list[str]) -> list[dict]:
+        if not prompts:
+            return []
+        # One context sequence per (prompt, alternative): prefix + all but the last token
+        # of the alternative. Identical sequences are evaluated once (with single-token
+        # words both alternatives share the same context -> one forward pass per prompt).
+        seqs: list[list[int]] = []
+        seq_index: dict[tuple, int] = {}
+        plan = []  # per prompt: [(seq_idx, alt_ids) for each alternative]
+        for p in prompts:
+            chat = judge_tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
+            )
+            prefix = judge_tokenizer(chat, add_special_tokens=False)["input_ids"] + prefix_tail
+            row = []
+            for alt in alternatives:
+                ctx = tuple(prefix + alt[:-1])
+                if ctx not in seq_index:
+                    seq_index[ctx] = len(seqs)
+                    seqs.append(list(ctx))
+                row.append((seq_index[ctx], alt))
+            plan.append(row)
+
+        # Left-pad so every context ends at the last position.
+        width = max(len(s) for s in seqs)
+        input_ids = torch.full((len(seqs), width), pad_id, dtype=torch.long)
+        attention = torch.zeros((len(seqs), width), dtype=torch.long)
+        for i, s in enumerate(seqs):
+            input_ids[i, width - len(s):] = torch.tensor(s, dtype=torch.long)
+            attention[i, width - len(s):] = 1
+        position_ids = (attention.cumsum(-1) - 1).clamp(min=0)
+        device = judge_model.device
+        input_ids, attention, position_ids = input_ids.to(device), attention.to(device), position_ids.to(device)
+
+        with torch.no_grad():
+            try:
+                out = judge_model(input_ids=input_ids, attention_mask=attention,
+                                  position_ids=position_ids, logits_to_keep=keep)
+            except TypeError:  # older transformers without logits_to_keep
+                out = judge_model(input_ids=input_ids, attention_mask=attention, position_ids=position_ids)
+            logprobs = torch.log_softmax(out.logits[:, -keep:, :].float(), dim=-1).cpu()
+
+        results = []
+        for row in plan:
+            full, first = [], []
+            for seq_i, alt in row:
+                m = len(alt)
+                # token j of the alternative is predicted at position -(m - j) of its context
+                lp = [logprobs[seq_i, keep - (m - j), tok].item() for j, tok in enumerate(alt)]
+                full.append(sum(lp))
+                first.append(lp[0])
+            results.append({
+                "logp_valid": full[0], "logp_invalid": full[1],
+                "first_logp_valid": first[0], "first_logp_invalid": first[1],
+                "n_tokens_valid": len(valid_ids), "n_tokens_invalid": len(invalid_ids),
+            })
+        return results
+
+    logprob_fn.num_sequences_per_prompt = len({tuple(a[:-1]) for a in alternatives})  # type: ignore
+    return logprob_fn
+
+
 def save_results_summary(results_list: list[dict[str, Any]], filepath: str = "outputs/results_summary.json") -> None:
     """
     Saves results_summary.json conforming strictly to the assignment schema:

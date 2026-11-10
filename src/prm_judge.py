@@ -1,6 +1,7 @@
 """
 src/prm_judge.py - PRM judge prompt construction, parsing, and step scoring.
 """
+import math
 import re
 from typing import Any, Callable
 
@@ -187,4 +188,52 @@ def score_path(
         "rationales": rationales,
         "judge_calls": len(steps),  # one judged step = one judge call
         "judge_tokens": judge_tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Optional bonus: continuous step confidence from the judge's logits
+# ---------------------------------------------------------------------------
+LogprobFn = Callable[[list[str]], list[dict]]
+# logprob_fn(judge_prompts) -> [{"logp_valid", "logp_invalid", "first_logp_valid", "first_logp_invalid"}, ...]
+
+
+def verdict_probability(logp_valid: float, logp_invalid: float) -> float:
+    """
+    p = exp(l_VALID) / (exp(l_VALID) + exp(l_INVALID)): the judge's probability of VALID,
+    renormalised over the two verdicts. Written as a sigmoid of the difference, which is
+    numerically stable for large gaps.
+    """
+    diff = logp_invalid - logp_valid
+    if diff > 0:
+        e = math.exp(-diff)
+        return e / (1.0 + e)
+    return 1.0 / (1.0 + math.exp(diff))
+
+
+def score_path_logprob(
+    question: str = "",
+    candidate: dict[str, Any] | None = None,
+    logprob_fn: LogprobFn | None = None,
+) -> dict[str, Any]:
+    """
+    Continuous counterpart of score_path. Uses the SAME judge prompts (built with
+    build_prm_judge_prompt, step t with steps[:t] as context) and returns per step:
+      step_probs              p_t from full-sequence log-probs (used for 'product_logprob')
+      step_probs_first_token  p_t from first-token log-probs (comparison)
+      step_scores             2 * p_t - 1, the continuous analogue of +1 / -1, so that
+                              aggregate_path_score(..., 'product_logprob') recovers p_t
+    """
+    if logprob_fn is None:
+        raise ValueError("score_path_logprob needs a logprob_fn.")
+    steps = list((candidate or {}).get("steps") or [])
+    prompts = [build_prm_judge_prompt(question, steps[:t], s) for t, s in enumerate(steps)]
+    outs = logprob_fn(prompts) if prompts else []
+    probs = [verdict_probability(o["logp_valid"], o["logp_invalid"]) for o in outs]
+    probs_first = [verdict_probability(o["first_logp_valid"], o["first_logp_invalid"]) for o in outs]
+    return {
+        "step_probs": probs,
+        "step_probs_first_token": probs_first,
+        "step_scores": [2.0 * p - 1.0 for p in probs],
+        "logprob_calls": len(prompts),
     }

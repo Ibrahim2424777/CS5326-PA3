@@ -18,7 +18,7 @@ from .utils import make_hf_judge_fn
 GenerateFn = Callable[[str, int, dict], list[dict]]
 JudgeFn = Callable[[str], dict]
 
-AGGREGATION_STRATEGIES = ("min", "product", "step_penalty")
+AGGREGATION_STRATEGIES = ("min", "product", "step_penalty", "product_logprob")
 SCORE_TIE_TOLERANCE = 1e-9
 
 
@@ -53,6 +53,13 @@ def aggregate_path_score(
     if strategy == "product":
         # Map r in {-1,+1} to a validity probability p in {0.01, 0.99}; joint validity = product.
         return math.prod(min(max((r + 1.0) / 2.0, 0.01), 0.99) for r in scores)
+
+    if strategy == "product_logprob":
+        # Optional bonus. Step scores are continuous, r_t = 2 * p_t - 1, where p_t is the
+        # judge's softmax probability of VALID vs INVALID (see prm_judge.score_path_logprob).
+        # Same joint-validity product as 'product', but WITHOUT the 0.01/0.99 clamp, which
+        # would erase the confidence information (most p_t are > 0.99).
+        return math.prod(min(max((r + 1.0) / 2.0, 0.0), 1.0) for r in scores)
 
     # "step_penalty": average step score minus lambda per INVALID step.
     num_invalid = sum(1 for r in scores if abs(r + 1.0) < 1e-9)

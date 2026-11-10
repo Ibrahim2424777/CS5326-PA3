@@ -527,6 +527,165 @@ def build_artifacts(records: list[dict], out_dir: str = "outputs") -> dict[str, 
     }
 
 
+# ---------------------------------------------------------------------------
+# Optional bonus: continuous logprob PRM ("product_logprob")
+# ---------------------------------------------------------------------------
+# (variant name, which per-step probabilities it uses)
+LOGPROB_VARIANTS = [
+    ("product_logprob", "step_probs"),                              # full-sequence (main)
+    ("product_logprob_first_token", "step_probs_first_token"),      # first-token comparison
+]
+
+
+def _call_with_oom_split(fn: Callable[[list], list], batch: list) -> list:
+    try:
+        return fn(batch)
+    except Exception as exc:  # CUDA OOM -> halve the batch and retry
+        if "out of memory" not in str(exc).lower() or len(batch) == 1:
+            raise
+        _empty_cuda_cache()
+        mid = len(batch) // 2
+        return _call_with_oom_split(fn, batch[:mid]) + _call_with_oom_split(fn, batch[mid:])
+
+
+class CachedLogprob:
+    """LogprobFn (list of judge prompts -> list of logprob dicts) with batched prefetch + cache."""
+
+    def __init__(self, batch_logprob_fn: Callable[[list[str]], list[dict]], batch_size: int = 16):
+        self.fn = batch_logprob_fn
+        self.batch_size = max(1, int(batch_size))
+        self.cache: dict[str, dict] = {}
+
+    def prefetch(self, prompts: list[str]) -> int:
+        todo = sorted(dict.fromkeys(p for p in prompts if p not in self.cache), key=len)
+        for i in range(0, len(todo), self.batch_size):
+            chunk = todo[i:i + self.batch_size]
+            for p, out in zip(chunk, _call_with_oom_split(self.fn, chunk)):
+                self.cache[p] = out
+        return len(todo)
+
+    def __call__(self, prompts: list[str]) -> list[dict]:
+        self.prefetch(prompts)
+        return [self.cache[p] for p in prompts]
+
+    def clear(self) -> None:
+        self.cache.clear()
+
+
+def logprob_problem(record: dict, scorer: CachedLogprob) -> dict:
+    """Rescores the 5 shared candidates of one main-run record with continuous step
+    probabilities and selects with 'product_logprob' (filter-then-vote, as before)."""
+    from .prm_judge import score_path_logprob  # local import keeps the main path lean
+
+    q, gt = record["question"], record["ground_truth_answer"]
+    shared = record["candidates"][:N_SHARED]
+
+    t0 = time.perf_counter()
+    scorer.prefetch(judge_prompts_for(q, shared))  # all steps of the problem, batched
+    cands = []
+    for c in shared:
+        res = score_path_logprob(question=q, candidate=c, logprob_fn=scorer)
+        cands.append({
+            "index": c["index"],
+            "answer": c["answer"],
+            "step_scores_binary": c["step_scores"],
+            "step_probs": res["step_probs"],
+            "step_probs_first_token": res["step_probs_first_token"],
+        })
+    selections = {}
+    for variant, key in LOGPROB_VARIANTS:
+        scored = [{"answer": c["answer"], "step_scores": [2.0 * p - 1.0 for p in c[key]]} for c in cands]
+        idx, score, tied = select_best_index(scored, "product_logprob")
+        ans = cands[idx]["answer"]
+        selections[variant] = {
+            "answer": ans, "correct": is_correct(ans, gt),
+            "selected_index": idx, "path_score": score, "num_tied": tied,
+        }
+    elapsed = time.perf_counter() - t0
+    scorer.clear()
+    return {
+        "problem_index": record["problem_index"],
+        "id": record["id"],
+        "ground_truth_answer": gt,
+        "candidates": cands,
+        "selections": selections,
+        "cost": {"logprob_calls": sum(len(c["step_probs"]) for c in cands), "time_seconds": elapsed},
+    }
+
+
+def run_logprob_phase(
+    main_records: list[dict],
+    scorer: CachedLogprob,
+    out_path: str = "outputs/logprob_bonus.jsonl",
+    progress: Callable | None = None,
+) -> list[dict]:
+    done = {r["id"]: r for r in read_jsonl(out_path)}
+    todo = [r for r in sorted(main_records, key=lambda r: r["problem_index"]) if r["id"] not in done]
+    iterator = progress(todo, desc="Logprob bonus") if progress else todo
+    for rec in iterator:
+        bonus = logprob_problem(rec, scorer)
+        append_jsonl(out_path, bonus)
+        done[rec["id"]] = bonus
+    return [done[r["id"]] for r in sorted(main_records, key=lambda r: r["problem_index"]) if r["id"] in done]
+
+
+def build_logprob_artifacts(
+    bonus_records: list[dict],
+    main_records: list[dict],
+    out_dir: str = "outputs",
+    approach: str = "",
+) -> dict[str, Any]:
+    """Writes outputs/logprob_bonus_summary.json (bonus results + comparison with the
+    discrete-verdict PRM) and rewrites outputs/logprob_bonus.jsonl sorted."""
+    bonus_records = sorted(bonus_records, key=lambda r: r["problem_index"])
+    main = {r["id"]: r for r in main_records}
+    n = len(bonus_records)
+
+    rows = []
+    for variant, _ in LOGPROB_VARIANTS:
+        rows.append({
+            "Strategy": variant,
+            "Accuracy (%)": _pct([b["selections"][variant]["correct"] for b in bonus_records]),
+            "Tie Rate (%)": _pct([b["selections"][variant]["num_tied"] > 1 for b in bonus_records]),
+        })
+    # Discrete-verdict references on the same problems (from the main run)
+    for k, (strategy, lam) in enumerate(ABLATION_CONFIGS):
+        rows.append({
+            "Strategy": f"{strategy} (binary)" if lam is None else f"{strategy} lambda={lam} (binary)",
+            "Accuracy (%)": _pct([main[b["id"]]["ablation"][k]["correct"] for b in bonus_records]),
+            "Tie Rate (%)": _pct([main[b["id"]]["ablation"][k]["num_tied"] > 1 for b in bonus_records]),
+        })
+
+    steps = [(s, p, pf) for b in bonus_records for c in b["candidates"]
+             for s, p, pf in zip(c["step_scores_binary"], c["step_probs"], c["step_probs_first_token"])]
+    p_valid = [p for s, p, _ in steps if s > 0]
+    p_invalid = [p for s, p, _ in steps if s < 0]
+    product_k = ABLATION_CONFIGS.index(("product", None))
+    changed = sum(
+        b["selections"]["product_logprob"]["selected_index"] != main[b["id"]]["ablation"][product_k]["selected_index"]
+        for b in bonus_records
+    )
+    summary = {
+        "approach": approach,
+        "num_problems": n,
+        "rows": rows,
+        "steps_scored": len(steps),
+        "verdict_agreement_%": _pct([(p > 0.5) == (s > 0) for s, p, _ in steps]),
+        "mean_p_valid_when_judge_said_VALID": round(sum(p_valid) / len(p_valid), 6) if p_valid else None,
+        "mean_p_valid_when_judge_said_INVALID": round(sum(p_invalid) / len(p_invalid), 6) if p_invalid else None,
+        "steps_with_p_between_0.1_and_0.9": sum(0.1 < p < 0.9 for _, p, _ in steps),
+        "max_abs_diff_full_vs_first_token": max((abs(p - pf) for _, p, pf in steps), default=0.0),
+        "problems_where_selection_differs_from_binary_product": changed,
+        "total_logprob_calls": sum(b["cost"]["logprob_calls"] for b in bonus_records),
+        "total_time_s": round(sum(b["cost"]["time_seconds"] for b in bonus_records), 2),
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "logprob_bonus_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    write_jsonl(os.path.join(out_dir, "logprob_bonus.jsonl"), bonus_records)
+    return summary
+
+
 def format_table(rows: list[dict]) -> str:
     """Plain-text table for notebook output (no extra dependencies)."""
     if not rows:
